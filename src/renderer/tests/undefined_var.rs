@@ -536,3 +536,445 @@ fn test_fallback_is_per_instance() {
     assert_eq!(tera_na.render("tpl", &Context::new()).unwrap(), "N/A");
     assert_eq!(tera_unk.render("tpl", &Context::new()).unwrap(), "UNKNOWN");
 }
+
+// ── I. Complex / deep templates ───────────────────────────────────────────────
+
+// --- Nesting ---
+
+/// Missing var at the inner level of nested ifs: the outer condition is true,
+/// but the inner condition uses an undefined variable — it evaluates to false
+/// and falls through to the else branch.
+#[test]
+fn test_nested_if_missing_at_inner_level() {
+    let mut ctx = Context::new();
+    ctx.insert("outer", &true);
+    let result = render(
+        "{% if outer %}{% if missing %}inner{% else %}fallthrough{% endif %}{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "fallthrough");
+}
+
+/// Three levels of nesting; the undefined variable sits at the middle level,
+/// preventing the innermost block from ever being reached.
+#[test]
+fn test_three_level_nested_if_missing_at_middle() {
+    let mut ctx = Context::new();
+    ctx.insert("l1", &true);
+    ctx.insert("l3", &true);
+    let result = render(
+        "{% if l1 %}A{% if l2 %}B{% if l3 %}C{% endif %}{% endif %}{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    // l2 is undefined → false → B and C are never rendered
+    assert_eq!(result, "A");
+}
+
+/// Undefined variable inside an else branch still renders the fallback.
+#[test]
+fn test_missing_in_else_branch() {
+    let mut ctx = Context::new();
+    ctx.insert("cond", &false);
+    let result = render(
+        "{% if cond %}yes{% else %}{{ missing }}{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "N/A");
+}
+
+/// if-elif-else: the first branch tests a missing variable (false), the elif
+/// matches a defined value — rendering continues from elif.
+#[test]
+fn test_if_elif_else_missing_first_branch() {
+    let mut ctx = Context::new();
+    ctx.insert("status", &"pending");
+    let result = render(
+        r#"{% if missing == "active" %}active{% elif status == "pending" %}pending{% else %}other{% endif %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "pending");
+}
+
+// --- Dotted paths ---
+
+/// Intermediate key in a dotted path is missing; the whole expression becomes
+/// the fallback.
+#[test]
+fn test_deep_dotted_path_intermediate_missing() {
+    let mut ctx = Context::new();
+    ctx.insert("obj", &json!({"level1": {"level2": "value"}}));
+    // obj and obj.level1 exist, but obj.level1.nope does not
+    assert_eq!(render("{{ obj.level1.nope }}", &ctx, "N/A"), "N/A");
+    // obj exists, obj.nope does not — further keys don't matter
+    assert_eq!(render("{{ obj.nope.level2 }}", &ctx, "N/A"), "N/A");
+}
+
+/// Undefined dotted path used inside a condition.
+#[test]
+fn test_deep_dotted_path_in_condition() {
+    let mut ctx = Context::new();
+    ctx.insert("config", &json!({"enabled": true}));
+    // config.timeout is missing → condition is false
+    let result = render(
+        "{% if config.timeout %}slow{% else %}default{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "default");
+}
+
+/// Undefined dotted path in an equality comparison.
+#[test]
+fn test_obj_missing_attr_eq_comparison() {
+    let mut ctx = Context::new();
+    ctx.insert("user", &json!({"name": "Alice"}));
+    // user.role is missing → eq returns false
+    let result = render(
+        r#"{% if user.role == "admin" %}admin{% else %}guest{% endif %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "guest");
+}
+
+/// Undefined dotted path as the LHS of `in`.
+#[test]
+fn test_obj_missing_attr_in_operator() {
+    let mut ctx = Context::new();
+    ctx.insert("user", &json!({"name": "Alice"}));
+    let result = render(
+        r#"{% if user.role in ["admin", "moderator"] %}privileged{% else %}regular{% endif %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "regular");
+}
+
+// --- Multiple / repeated missing vars ---
+
+/// Every occurrence of a missing variable in the same template gets the
+/// fallback independently.
+#[test]
+fn test_repeated_reference_to_same_missing_var() {
+    let result = render(
+        "{{ x }}, {{ x }}, {{ x }}",
+        &Context::new(),
+        "N/A",
+    );
+    assert_eq!(result, "N/A, N/A, N/A");
+}
+
+/// Mixture of defined and undefined fields across a multi-field template.
+#[test]
+fn test_multiple_missing_fields_with_defined_ones() {
+    let mut ctx = Context::new();
+    ctx.insert("username", &"alice");
+    let result = render(
+        "User: {{ username }}, Email: {{ email }}, Score: {{ score }}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "User: alice, Email: N/A, Score: N/A");
+}
+
+/// Both the output block and the condition reference the same missing variable;
+/// the output renders the fallback while the condition evaluates to false.
+#[test]
+fn test_output_and_condition_same_missing_var() {
+    let result = render(
+        "val={{ missing }}, set={% if missing %}yes{% else %}no{% endif %}",
+        &Context::new(),
+        "N/A",
+    );
+    assert_eq!(result, "val=N/A, set=no");
+}
+
+// --- Boolean logic ---
+
+/// Or-chain where every operand is undefined: all evaluate to false.
+#[test]
+fn test_or_chain_all_missing() {
+    let result = render(
+        "{% if a or b or c %}yes{% else %}no{% endif %}",
+        &Context::new(),
+        "N/A",
+    );
+    assert_eq!(result, "no");
+}
+
+/// And-chain with a missing variable in the middle: the whole condition
+/// short-circuits to false.
+#[test]
+fn test_and_chain_missing_in_middle() {
+    let mut ctx = Context::new();
+    ctx.insert("a", &true);
+    ctx.insert("c", &true);
+    let result = render(
+        "{% if a and missing and c %}yes{% else %}no{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "no");
+}
+
+/// Missing on the LHS of an equality inside an or-chain: the undefined
+/// comparison is false but the other operand (defined, true) wins.
+#[test]
+fn test_eq_with_missing_in_or_chain_defined_side_wins() {
+    let mut ctx = Context::new();
+    ctx.insert("status", &"active");
+    let result = render(
+        r#"{% if missing == "x" or status == "active" %}yes{% else %}no{% endif %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "yes");
+}
+
+/// A complex boolean `(a == x or b == y) and flag` where both comparisons
+/// involve undefined variables — the whole condition is false.
+#[test]
+fn test_complex_boolean_all_comparisons_missing() {
+    let mut ctx = Context::new();
+    ctx.insert("flag", &true);
+    let result = render(
+        r#"{% if (a == "x" or b == "y") and flag %}yes{% else %}no{% endif %}"#,
+        &ctx,
+        "N/A",
+    );
+    // (false or false) and true → false
+    assert_eq!(result, "no");
+}
+
+/// A variable compared with itself when both sides are undefined evaluates to
+/// false — the two lookups each produce VariableNotFound independently.
+#[test]
+fn test_missing_var_compared_with_itself_is_false() {
+    let result = render(
+        "{% if missing == missing %}yes{% else %}no{% endif %}",
+        &Context::new(),
+        "N/A",
+    );
+    // Not "equal to itself": both sides are undefined, comparison → false
+    assert_eq!(result, "no");
+}
+
+// --- `in` with defined collections ---
+
+/// Undefined LHS checked against a defined array: treated as "not present".
+#[test]
+fn test_in_missing_lhs_defined_array() {
+    let mut ctx = Context::new();
+    ctx.insert("allowed", &vec!["admin", "user", "moderator"]);
+    let result = render(
+        "{% if user_role in allowed %}ok{% else %}denied{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "denied");
+}
+
+/// `not in` with undefined LHS and defined array: undefined is not in the
+/// list, so `not in` is true.
+#[test]
+fn test_not_in_missing_lhs_defined_array() {
+    let mut ctx = Context::new();
+    ctx.insert("blocked", &vec!["banned1", "banned2"]);
+    let result = render(
+        "{% if user_role not in blocked %}allowed{% else %}blocked{% endif %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "allowed");
+}
+
+// --- set interactions ---
+
+/// `{% set x = missing | upper %}` — the filter pipeline on a missing variable
+/// is never executed; the set tag assigns the fallback string directly.
+#[test]
+fn test_set_from_missing_with_filter_assigns_fallback() {
+    let result = render(
+        "{% set x = missing | upper %}{{ x }}",
+        &Context::new(),
+        "N/A",
+    );
+    // filter is skipped; x = "N/A" (not "N/A" uppercased)
+    assert_eq!(result, "N/A");
+}
+
+// ── J. For-loop contexts ───────────────────────────────────────────────────────
+
+/// A global missing variable referenced inside a for loop body is replaced
+/// with the fallback on every iteration.
+#[test]
+fn test_global_missing_inside_for_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("items", &vec!["a", "b", "c"]);
+    let result = render(
+        "{% for item in items %}{{ item }}/{{ sep }} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    // `sep` is missing → fallback on every iteration
+    assert_eq!(result, "a/N/A b/N/A c/N/A ");
+}
+
+/// Missing attribute on each loop object: the attribute is absent on all items,
+/// so every iteration outputs the fallback.
+#[test]
+fn test_missing_attr_on_every_loop_item() {
+    let mut ctx = Context::new();
+    ctx.insert("users", &json!([{"name": "Alice"}, {"name": "Bob"}]));
+    let result = render(
+        "{% for u in users %}{{ u.name }}:{{ u.email }} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "Alice:N/A Bob:N/A ");
+}
+
+/// `{% if item.attr %}` used as a guard: when the attribute is missing the
+/// condition is false and the block body is never rendered.
+#[test]
+fn test_if_guard_on_missing_attr_skips_body() {
+    let mut ctx = Context::new();
+    ctx.insert("users", &json!([{"name": "Alice"}, {"name": "Bob"}]));
+    let result = render(
+        "{% for u in users %}{% if u.active %}{{ u.name }}{% endif %}{% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    // active is missing on both items → condition false → nothing rendered
+    assert_eq!(result, "");
+}
+
+/// Loop items where the attribute is present on some but absent on others:
+/// the absent ones render the fallback, present ones render normally.
+#[test]
+fn test_missing_attr_on_some_loop_items() {
+    let mut ctx = Context::new();
+    ctx.insert("users", &json!([
+        {"name": "Alice"},
+        {"name": "Bob", "email": "bob@example.com"},
+        {"name": "Carol"}
+    ]));
+    let result = render(
+        "{% for u in users %}{{ u.name }}:{{ u.email }} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "Alice:N/A Bob:bob@example.com Carol:N/A ");
+}
+
+/// A conditional display pattern inside a loop: show an optional badge only
+/// when the attribute is present; missing → condition false → badge skipped.
+#[test]
+fn test_conditional_badge_on_missing_attr_in_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("products", &json!([
+        {"name": "Apple",  "price": 1},
+        {"name": "Banana", "price": 2, "discount": 10}
+    ]));
+    let result = render(
+        "{% for p in products %}{{ p.name }}/${{ p.price }}{% if p.discount %}(-{{ p.discount }}%){% endif %} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "Apple/$1 Banana/$2(-10%) ");
+}
+
+/// Equality check on a missing attribute inside a loop: the undefined side
+/// makes the comparison false, falling through to the else branch.
+#[test]
+fn test_eq_on_missing_attr_inside_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("users", &json!([
+        {"name": "Alice"},
+        {"name": "Bob", "role": "admin"}
+    ]));
+    let result = render(
+        r#"{% for u in users %}{{ u.name }}={% if u.role == "admin" %}admin{% else %}user{% endif %} {% endfor %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "Alice=user Bob=admin ");
+}
+
+/// `in` check on a missing attribute inside a loop: absent attribute is
+/// treated as "not present", present attribute is checked normally.
+#[test]
+fn test_in_on_missing_attr_inside_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("users", &json!([
+        {"name": "Alice"},
+        {"name": "Bob",   "role": "mod"},
+        {"name": "Carol", "role": "admin"}
+    ]));
+    let result = render(
+        r#"{% for u in users %}{% if u.role in ["admin", "mod"] %}+{% else %}-{% endif %}{% endfor %}"#,
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "-++");
+}
+
+/// `{% set %}` inside a loop from a missing attribute: the variable is
+/// assigned the fallback for items that lack the attribute.
+#[test]
+fn test_set_from_missing_attr_inside_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("items", &json!([
+        {"value": 1},
+        {"value": 2, "label": "two"},
+        {"value": 3}
+    ]));
+    let result = render(
+        "{% for item in items %}{% set lbl = item.label %}{{ lbl }} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "N/A two N/A ");
+}
+
+/// Compound case: a global missing variable and a per-item missing attribute
+/// interact inside the same loop. The condition on the per-item attribute
+/// falls through to an else that uses the global missing variable.
+#[test]
+fn test_compound_global_missing_and_attr_missing_in_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("records", &json!([
+        {"id": 1, "value": 10},
+        {"id": 2},
+        {"id": 3, "value": 30}
+    ]));
+    let result = render(
+        "{% for r in records %}{{ r.id }}:{% if r.value %}{{ r.value }}{% else %}{{ default_val }}{% endif %} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    // record 2: r.value missing → condition false → else → {{ default_val }} (global missing) → "N/A"
+    assert_eq!(result, "1:10 2:N/A 3:30 ");
+}
+
+/// `{% if missing %}` output block vs a defined variable output in the same
+/// loop: the condition gate works per-item independently of {{ }} output.
+#[test]
+fn test_condition_gate_and_output_per_item_in_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("items", &json!([
+        {"id": 1, "note": "first"},
+        {"id": 2},
+        {"id": 3, "note": "third"}
+    ]));
+    let result = render(
+        "{% for it in items %}{{ it.id }}{% if it.note %}[{{ it.note }}]{% endif %} {% endfor %}",
+        &ctx,
+        "N/A",
+    );
+    assert_eq!(result, "1[first] 2 3[third] ");
+}
