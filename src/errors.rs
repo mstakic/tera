@@ -49,6 +49,8 @@ pub enum ErrorKind {
         /// The context that indicates where the error occurs in the rendering process
         context: String,
     },
+    /// A variable was not found in the context during rendering
+    VariableNotFound(String),
     /// This enum may grow additional variants, so this makes sure clients
     /// don't count on exhaustive matching. (Otherwise, adding a new variant
     /// could break existing code.)
@@ -95,6 +97,7 @@ impl fmt::Display for Error {
             ErrorKind::Utf8Conversion { ref context } => {
                 write!(f, "UTF-8 conversion error occured while rendering template: {}", context)
             }
+            ErrorKind::VariableNotFound(ref msg) => write!(f, "{}", msg),
             ErrorKind::__Nonexhaustive => write!(f, "Nonexhaustive"),
         }
     }
@@ -149,6 +152,11 @@ impl Error {
     /// Creates a function not found error
     pub fn function_not_found(name: impl ToString) -> Self {
         Self { kind: ErrorKind::FunctionNotFound(name.to_string()), source: None }
+    }
+
+    /// Create VariableNotFound error
+    pub fn variable_not_found(msg: impl ToString) -> Self {
+        Self { kind: ErrorKind::VariableNotFound(msg.to_string()), source: None }
     }
 
     /// Creates generic error with a source

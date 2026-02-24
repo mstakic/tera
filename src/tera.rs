@@ -76,6 +76,11 @@ pub struct Tera {
     pub autoescape_suffixes: Vec<&'static str>,
     #[doc(hidden)]
     escape_fn: EscapeFn,
+    // Value to render when a variable is not found in the context.
+    // None -> render error
+    // Some -> missing variables render as undefined_variable_value
+    #[doc(hidden)]
+    pub undefined_variable_value: Option<String>,
 }
 
 impl Tera {
@@ -95,6 +100,7 @@ impl Tera {
             testers: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
+            undefined_variable_value: None,
         };
 
         tera.load_from_glob()?;
@@ -827,6 +833,11 @@ impl Tera {
         self.escape_fn = escape_html;
     }
 
+    /// Set the value to render when a variable is not found in the context.
+    pub fn set_undefined_variable_value(&mut self, value: Option<String>) {
+        self.undefined_variable_value = value;
+    }
+
     /// Re-parse all templates found in the glob given to Tera.
     ///
     /// Use this when you are watching a directory and want to reload everything,
@@ -899,6 +910,7 @@ impl Default for Tera {
             functions: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
+            undefined_variable_value: None,
         };
 
         tera.register_tera_filters();
@@ -955,7 +967,7 @@ mod tests {
             ("c", "{% extends \"d\" %}"),
             ("d", ""),
         ])
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             tera.get_template("a").unwrap().parents,
