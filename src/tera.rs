@@ -76,11 +76,11 @@ pub struct Tera {
     pub autoescape_suffixes: Vec<&'static str>,
     #[doc(hidden)]
     escape_fn: EscapeFn,
-    // Value to render when a variable is not found in the context.
-    // None -> render error
-    // Some -> missing variables render as undefined_variable_value
+    // When true, missing variables do not abort rendering.
+    // The fallback value is read from the `undefined_var_fallback` 
+    // or rendered as `[ERROR: ...]`
     #[doc(hidden)]
-    pub undefined_variable_value: Option<String>,
+    pub loosely_render: bool,
 }
 
 impl Tera {
@@ -100,7 +100,7 @@ impl Tera {
             testers: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
-            undefined_variable_value: None,
+            loosely_render: false,
         };
 
         tera.load_from_glob()?;
@@ -833,9 +833,9 @@ impl Tera {
         self.escape_fn = escape_html;
     }
 
-    /// Set the value to render when a variable is not found in the context.
-    pub fn set_undefined_variable_value(&mut self, value: Option<String>) {
-        self.undefined_variable_value = value;
+    /// Enable loose rendering mode
+    pub fn set_loosely_render(&mut self, enable: bool) {
+        self.loosely_render = enable;
     }
 
     /// Re-parse all templates found in the glob given to Tera.
@@ -910,7 +910,7 @@ impl Default for Tera {
             functions: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
-            undefined_variable_value: None,
+            loosely_render: false,
         };
 
         tera.register_tera_filters();

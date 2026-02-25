@@ -315,7 +315,7 @@ impl<'a> Processor<'a> {
             .err()
             .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
 
-        if self.tera.undefined_variable_value.is_some() && (lhs_is_undefined || rhs_is_undefined) {
+        if self.tera.loosely_render && (lhs_is_undefined || rhs_is_undefined) {
             return Ok(in_cond.negated);
         }
 
@@ -475,16 +475,36 @@ impl<'a> Processor<'a> {
         res
     }
 
+    fn loose_fallback_value(&self, err: &Error) -> String {
+        match self.call_stack.lookup("undefined_var_fallback") {
+            Some(v) => match v.as_ref() {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            },
+            None => {
+                // error: Variable `var` not found in context while rendering...
+                let var_name = if let ErrorKind::VariableNotFound(ref msg) = err.kind {
+                    msg.split('`').nth(1).unwrap_or("unknown")
+                } else {
+                    "unknown"
+                };
+                format!("[ERROR Rendering segment: Variable `{}` not found]", var_name)
+            }
+        }
+    }
+
     /// Evaluate a set tag and add the value to the right context
     fn eval_set(&mut self, set: &'a Set) -> Result<()> {
         let assigned_value = match self.safe_eval_expression(&set.value) {
             Ok(val) => val,
-            Err(e) => match (&self.tera.undefined_variable_value, &e.kind) {
-                (Some(fallback), ErrorKind::VariableNotFound(_)) => {
-                    Cow::Owned(Value::String(fallback.clone()))
+            Err(e) => {
+                if self.tera.loosely_render && matches!(e.kind, ErrorKind::VariableNotFound(_)) {
+                    let fallback = self.loose_fallback_value(&e);
+                    Cow::Owned(Value::String(fallback))
+                } else {
+                    return Err(e);
                 }
-                _ => return Err(e),
-            },
+            }
         };
         self.call_stack.add_assignment(&set.key[..], set.global, assigned_value);
         Ok(())
@@ -639,9 +659,7 @@ impl<'a> Processor<'a> {
                             .err()
                             .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
 
-                        if self.tera.undefined_variable_value.is_some()
-                            && (lhs_is_undefined || rhs_is_undefined)
-                        {
+                        if self.tera.loosely_render && (lhs_is_undefined || rhs_is_undefined) {
                             false
                         } else {
                             let mut lhs_val = lhs_result?;
@@ -1002,12 +1020,14 @@ impl<'a> Processor<'a> {
             Node::Text(ref s) | Node::Raw(_, ref s, _) => write!(write, "{}", s)?,
             Node::VariableBlock(_, ref expr) => match self.eval_expression(expr) {
                 Ok(val) => val.render(write)?,
-                Err(e) => match (&self.tera.undefined_variable_value, &e.kind) {
-                    (Some(fallback), ErrorKind::VariableNotFound(_)) => {
-                        write!(write, "{}", fallback)?
+                Err(e) => {
+                    if self.tera.loosely_render && matches!(e.kind, ErrorKind::VariableNotFound(_)) {
+                        let fallback = self.loose_fallback_value(&e);
+                        write!(write, "{}", fallback)?;
+                    } else {
+                        return Err(e);
                     }
-                    _ => return Err(e),
-                },
+                }
             },
             Node::Set(_, ref set) => self.eval_set(set)?,
             Node::FilterSection(_, FilterSection { ref filter, ref body }, _) => {

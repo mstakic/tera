@@ -1,13 +1,16 @@
-/// Tests for `Tera::set_undefined_variable_value` — the lenient rendering mode
-/// where variables that are missing from the context render as a configured
-/// fallback string instead of failing.
+/// Tests for `Tera::set_loosely_render` — the lenient rendering mode where
+/// variables missing from the context are rendered using the template-defined
+/// `undefined_var_fallback` variable (set via
+/// `{% set undefined_var_fallback = '...' %}`), or as
+/// `[ERROR Rendering segment: Variable \`NAME\` not found]` when that variable
+/// is absent.
 ///
 /// The tests are grouped into:
 ///   A. Basic VariableBlock output — what works
 ///   B. Filters on missing variables
 ///   C. Conditionals (if / not / and / or)
 ///   D. Testers (is defined / is undefined / is string / …)
-///   E. Things that STILL fail despite the fallback being set
+///   E. Things that STILL fail despite loose rendering being enabled
 ///   F. Subtle / surprising rendering behaviours
 ///   G. Configuration lifecycle
 use serde_json::json;
@@ -20,21 +23,29 @@ use crate::tera::Tera;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn tera_with_fallback(fallback: &str) -> Tera {
+/// Build a Tera instance with loose rendering enabled.
+fn tera_loosely() -> Tera {
     let mut tera = Tera::default();
-    tera.set_undefined_variable_value(Some(fallback.to_string()));
+    tera.set_loosely_render(true);
     tera
 }
 
+/// Render `template` in loose mode with `fallback` as the
+/// `undefined_var_fallback` template variable.
+///
+/// The fallback is injected by prepending
+/// `{% set undefined_var_fallback = '...' %}` to the template.
 fn render(template: &str, ctx: &Context, fallback: &str) -> String {
-    let mut tera = tera_with_fallback(fallback);
-    tera.add_raw_template("tpl", template).unwrap();
+    let mut tera = tera_loosely();
+    let full = format!("{{% set undefined_var_fallback = '{}' %}}{}", fallback, template);
+    tera.add_raw_template("tpl", &full).unwrap();
     tera.render("tpl", ctx).unwrap()
 }
 
 fn render_err(template: &str, ctx: &Context, fallback: &str) -> crate::errors::Error {
-    let mut tera = tera_with_fallback(fallback);
-    tera.add_raw_template("tpl", template).unwrap();
+    let mut tera = tera_loosely();
+    let full = format!("{{% set undefined_var_fallback = '{}' %}}{}", fallback, template);
+    tera.add_raw_template("tpl", &full).unwrap();
     tera.render("tpl", ctx).unwrap_err()
 }
 
@@ -104,7 +115,7 @@ fn test_filter_is_not_applied_to_fallback() {
 #[test]
 fn test_explicit_default_filter_takes_priority_over_fallback() {
     // An explicit `| default(value=...)` filter is evaluated before the
-    // undefined_variable_value kicks in, so it wins.
+    // loose-render fallback kicks in, so it wins.
     let result = render(r#"{{ missing | default(value="explicit") }}"#, &Context::new(), "N/A");
     assert_eq!(result, "explicit");
 }
@@ -456,9 +467,15 @@ fn test_string_concat_missing_then_present_is_fallback() {
 #[test]
 fn test_fallback_not_html_escaped_in_autoescape_context() {
     let mut tera = Tera::default();
+    tera.set_loosely_render(true);
     // The ".html" suffix enables autoescaping.
-    tera.add_raw_template("tpl.html", "{{ missing }}").unwrap();
-    tera.set_undefined_variable_value(Some("<b>N/A</b>".to_string()));
+    // The undefined_var_fallback contains raw HTML — it will be written as-is
+    // because loose_fallback_value bypasses the escape function.
+    tera.add_raw_template(
+        "tpl.html",
+        "{% set undefined_var_fallback = '<b>N/A</b>' %}{{ missing }}",
+    )
+    .unwrap();
 
     let result = tera.render("tpl.html", &Context::new()).unwrap();
     // Raw HTML is output as-is; no escaping applied to the fallback.
@@ -470,8 +487,12 @@ fn test_fallback_not_html_escaped_in_autoescape_context() {
 #[test]
 fn test_defined_variable_still_escaped_in_autoescape_context() {
     let mut tera = Tera::default();
-    tera.add_raw_template("tpl.html", "{{ xss }}{{ missing }}").unwrap();
-    tera.set_undefined_variable_value(Some("N/A".to_string()));
+    tera.set_loosely_render(true);
+    tera.add_raw_template(
+        "tpl.html",
+        "{% set undefined_var_fallback = 'N/A' %}{{ xss }}{{ missing }}",
+    )
+    .unwrap();
 
     let mut ctx = Context::new();
     ctx.insert("xss", &"<script>");
@@ -482,16 +503,38 @@ fn test_defined_variable_still_escaped_in_autoescape_context() {
 
 // ── G. Configuration lifecycle ────────────────────────────────────────────────
 
-/// Disabling the fallback (passing None) restores strict error behaviour.
+/// Toggling `set_loosely_render` on and off controls whether missing variables
+/// abort rendering.
+///
+/// - loose on, no `undefined_var_fallback` → renders `[ERROR Rendering segment: Variable \`...\` not found]`
+/// - loose on, `undefined_var_fallback = 'N/A'` → renders "N/A"
+/// - loose off (default) → hard render error
 #[test]
-fn test_disable_fallback_restores_strict_mode() {
+fn test_loose_render_toggle_controls_strict_mode() {
     let mut tera = Tera::default();
     tera.add_raw_template("tpl", "{{ missing }}").unwrap();
+    tera.add_raw_template(
+        "tpl_with_fallback",
+        "{% set undefined_var_fallback = 'N/A' %}{{ missing }}",
+    )
+    .unwrap();
 
-    tera.set_undefined_variable_value(Some("N/A".to_string()));
-    assert_eq!(tera.render("tpl", &Context::new()).unwrap(), "N/A");
+    // Strict mode (default) — must error.
+    assert!(tera.render("tpl", &Context::new()).is_err());
 
-    tera.set_undefined_variable_value(None);
+    // Loose mode without template fallback — renders error segment tag.
+    tera.set_loosely_render(true);
+    let result = tera.render("tpl", &Context::new()).unwrap();
+    assert!(
+        result.starts_with("[ERROR Rendering segment:"),
+        "unexpected output: {result}"
+    );
+
+    // Loose mode with template fallback — renders the fallback value.
+    assert_eq!(tera.render("tpl_with_fallback", &Context::new()).unwrap(), "N/A");
+
+    // Disable loose rendering — back to strict mode.
+    tera.set_loosely_render(false);
     assert!(tera.render("tpl", &Context::new()).is_err());
 }
 
@@ -522,19 +565,25 @@ fn test_without_fallback_error_kind_is_variable_not_found() {
     );
 }
 
-/// Fallback is per-Tera-instance; two instances can have different fallbacks.
+/// The fallback value is per-template: two templates can define different
+/// `undefined_var_fallback` values in the same Tera instance.
 #[test]
-fn test_fallback_is_per_instance() {
-    let mut tera_na = Tera::default();
-    tera_na.add_raw_template("tpl", "{{ missing }}").unwrap();
-    tera_na.set_undefined_variable_value(Some("N/A".to_string()));
+fn test_fallback_is_per_template() {
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    tera.add_raw_template(
+        "tpl_na",
+        "{% set undefined_var_fallback = 'N/A' %}{{ missing }}",
+    )
+    .unwrap();
+    tera.add_raw_template(
+        "tpl_unk",
+        "{% set undefined_var_fallback = 'UNKNOWN' %}{{ missing }}",
+    )
+    .unwrap();
 
-    let mut tera_unk = Tera::default();
-    tera_unk.add_raw_template("tpl", "{{ missing }}").unwrap();
-    tera_unk.set_undefined_variable_value(Some("UNKNOWN".to_string()));
-
-    assert_eq!(tera_na.render("tpl", &Context::new()).unwrap(), "N/A");
-    assert_eq!(tera_unk.render("tpl", &Context::new()).unwrap(), "UNKNOWN");
+    assert_eq!(tera.render("tpl_na", &Context::new()).unwrap(), "N/A");
+    assert_eq!(tera.render("tpl_unk", &Context::new()).unwrap(), "UNKNOWN");
 }
 
 // ── I. Complex / deep templates ───────────────────────────────────────────────
@@ -977,4 +1026,97 @@ fn test_condition_gate_and_output_per_item_in_loop() {
         "N/A",
     );
     assert_eq!(result, "1[first] 2 3[third] ");
+}
+
+// ── K. undefined_var_fallback template variable ───────────────────────────────
+
+/// When `undefined_var_fallback` is set in the template, missing variables
+/// render as that value.
+#[test]
+fn test_template_fallback_var_used_for_missing() {
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    tera.add_raw_template(
+        "tpl",
+        "{% set undefined_var_fallback = 'N/A' %}{{ missing }}",
+    )
+    .unwrap();
+    assert_eq!(tera.render("tpl", &Context::new()).unwrap(), "N/A");
+}
+
+/// When `undefined_var_fallback` is NOT set and loose rendering is on,
+/// missing variables render as `[ERROR Rendering segment: Variable \`...\` not found]`.
+#[test]
+fn test_no_template_fallback_var_renders_error_tag() {
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    tera.add_raw_template("tpl", "{{ missing }}").unwrap();
+    let result = tera.render("tpl", &Context::new()).unwrap();
+    assert_eq!(result, "[ERROR Rendering segment: Variable `missing` not found]");
+}
+
+/// `undefined_var_fallback` is visible inside for-loops (it lives in the
+/// Origin frame which the lookup traverses).
+#[test]
+fn test_template_fallback_var_accessible_inside_for_loop() {
+    let mut ctx = Context::new();
+    ctx.insert("items", &vec!["a", "b"]);
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    tera.add_raw_template(
+        "tpl",
+        "{% set undefined_var_fallback = 'X' %}{% for item in items %}{{ item }}:{{ sep }} {% endfor %}",
+    )
+    .unwrap();
+    let result = tera.render("tpl", &ctx).unwrap();
+    assert_eq!(result, "a:X b:X ");
+}
+
+/// `undefined_var_fallback` set via `{% set_global %}` inside a block is also
+/// found when the block is later rendered.
+#[test]
+fn test_template_fallback_var_set_before_usage() {
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    // Fallback is set, then a missing variable is referenced.
+    tera.add_raw_template(
+        "tpl",
+        "before:{{ x }} {% set undefined_var_fallback = 'FB' %} after:{{ y }}",
+    )
+    .unwrap();
+    // `x` is referenced BEFORE the set — no fallback yet → [ERROR Rendering segment: ...]
+    // `y` is referenced AFTER the set → "FB"
+    let result = tera.render("tpl", &Context::new()).unwrap();
+    assert!(
+        result.starts_with("before:[ERROR Rendering segment:"),
+        "unexpected: {result}"
+    );
+    assert!(result.ends_with("after:FB"), "unexpected: {result}");
+}
+
+/// `{% set %}` with a missing RHS resolves to `undefined_var_fallback`.
+#[test]
+fn test_set_from_missing_uses_template_fallback_var() {
+    let mut tera = Tera::default();
+    tera.set_loosely_render(true);
+    tera.add_raw_template(
+        "tpl",
+        "{% set undefined_var_fallback = 'default' %}{% set x = missing %}{{ x }}",
+    )
+    .unwrap();
+    assert_eq!(tera.render("tpl", &Context::new()).unwrap(), "default");
+}
+
+/// Without `loosely_render` enabled, `undefined_var_fallback` in the template
+/// has no special meaning — missing variables still abort rendering.
+#[test]
+fn test_template_fallback_var_ignored_in_strict_mode() {
+    let mut tera = Tera::default();
+    // loosely_render is false (default)
+    tera.add_raw_template(
+        "tpl",
+        "{% set undefined_var_fallback = 'N/A' %}{{ missing }}",
+    )
+    .unwrap();
+    assert!(tera.render("tpl", &Context::new()).is_err());
 }
