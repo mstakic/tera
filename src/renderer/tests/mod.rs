@@ -5,6 +5,7 @@ mod errors;
 mod inheritance;
 mod macros;
 mod square_brackets;
+mod undefined_var;
 mod whitespace;
 
 #[allow(dead_code)]

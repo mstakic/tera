@@ -5,7 +5,7 @@ use std::io::Write;
 use serde_json::{to_string_pretty, to_value, Number, Value};
 
 use crate::context::{ValueRender, ValueTruthy};
-use crate::errors::{Error, Result};
+use crate::errors::{Error, ErrorKind, Result};
 use crate::parser::ast::*;
 use crate::renderer::call_stack::CallStack;
 use crate::renderer::for_loop::ForLoop;
@@ -75,7 +75,7 @@ fn process_path<'a>(path: &str, call_stack: &CallStack<'a>) -> Result<Val<'a>> {
     if !path.contains('[') {
         match call_stack.lookup(path) {
             Some(v) => Ok(v),
-            None => Err(Error::msg(format!(
+            None => Err(Error::variable_not_found(format!(
                 "Variable `{}` not found in context while rendering '{}'",
                 path,
                 call_stack.active_template().name
@@ -86,7 +86,7 @@ fn process_path<'a>(path: &str, call_stack: &CallStack<'a>) -> Result<Val<'a>> {
 
         match call_stack.lookup(&full_path) {
             Some(v) => Ok(v),
-            None => Err(Error::msg(format!(
+            None => Err(Error::variable_not_found(format!(
                 "Variable `{}` not found in context while rendering '{}': \
                  the evaluated version was `{}`. Maybe the index is out of bounds?",
                 path,
@@ -303,8 +303,24 @@ impl<'a> Processor<'a> {
     }
 
     fn eval_in_condition(&mut self, in_cond: &'a In) -> Result<bool> {
-        let lhs = self.safe_eval_expression(&in_cond.lhs)?;
-        let rhs = self.safe_eval_expression(&in_cond.rhs)?;
+        let lhs_result = self.safe_eval_expression(&in_cond.lhs);
+        let rhs_result = self.safe_eval_expression(&in_cond.rhs);
+
+        let lhs_is_undefined = lhs_result
+            .as_ref()
+            .err()
+            .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
+        let rhs_is_undefined = rhs_result
+            .as_ref()
+            .err()
+            .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
+
+        if self.tera.loosely_render && (lhs_is_undefined || rhs_is_undefined) {
+            return Ok(in_cond.negated);
+        }
+
+        let lhs = lhs_result?;
+        let rhs = rhs_result?;
 
         let present = match *rhs {
             Value::Array(ref v) => v.contains(&lhs),
@@ -459,9 +475,37 @@ impl<'a> Processor<'a> {
         res
     }
 
+    fn loose_fallback_value(&self, err: &Error) -> String {
+        match self.call_stack.lookup("undefined_var_fallback") {
+            Some(v) => match v.as_ref() {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            },
+            None => {
+                // error: Variable `var` not found in context while rendering...
+                let var_name = if let ErrorKind::VariableNotFound(ref msg) = err.kind {
+                    msg.split('`').nth(1).unwrap_or("unknown")
+                } else {
+                    "unknown"
+                };
+                format!("[ERROR Rendering segment: Variable `{}` not found]", var_name)
+            }
+        }
+    }
+
     /// Evaluate a set tag and add the value to the right context
     fn eval_set(&mut self, set: &'a Set) -> Result<()> {
-        let assigned_value = self.safe_eval_expression(&set.value)?;
+        let assigned_value = match self.safe_eval_expression(&set.value) {
+            Ok(val) => val,
+            Err(e) => {
+                if self.tera.loosely_render && matches!(e.kind, ErrorKind::VariableNotFound(_)) {
+                    let fallback = self.loose_fallback_value(&e);
+                    Cow::Owned(Value::String(fallback))
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         self.call_stack.add_assignment(&set.key[..], set.global, assigned_value);
         Ok(())
     }
@@ -603,28 +647,44 @@ impl<'a> Processor<'a> {
                         }
                     }
                     LogicOperator::Eq | LogicOperator::NotEq => {
-                        let mut lhs_val = self.eval_expression(lhs)?;
-                        let mut rhs_val = self.eval_expression(rhs)?;
+                        let lhs_result = self.eval_expression(lhs);
+                        let rhs_result = self.eval_expression(rhs);
 
-                        // Monomorphize number vals.
-                        if lhs_val.is_number() || rhs_val.is_number() {
-                            // We're not implementing JS so can't compare things of different types
-                            if !lhs_val.is_number() || !rhs_val.is_number() {
-                                return Ok(false);
+                        let lhs_is_undefined = lhs_result
+                            .as_ref()
+                            .err()
+                            .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
+                        let rhs_is_undefined = rhs_result
+                            .as_ref()
+                            .err()
+                            .map_or(false, |e| matches!(e.kind, ErrorKind::VariableNotFound(_)));
+
+                        if self.tera.loosely_render && (lhs_is_undefined || rhs_is_undefined) {
+                            false
+                        } else {
+                            let mut lhs_val = lhs_result?;
+                            let mut rhs_val = rhs_result?;
+
+                            // Monomorphize number vals.
+                            if lhs_val.is_number() || rhs_val.is_number() {
+                                // We're not implementing JS so can't compare things of different types
+                                if !lhs_val.is_number() || !rhs_val.is_number() {
+                                    return Ok(false);
+                                }
+
+                                lhs_val = Cow::Owned(Value::Number(
+                                    Number::from_f64(lhs_val.as_f64().unwrap()).unwrap(),
+                                ));
+                                rhs_val = Cow::Owned(Value::Number(
+                                    Number::from_f64(rhs_val.as_f64().unwrap()).unwrap(),
+                                ));
                             }
 
-                            lhs_val = Cow::Owned(Value::Number(
-                                Number::from_f64(lhs_val.as_f64().unwrap()).unwrap(),
-                            ));
-                            rhs_val = Cow::Owned(Value::Number(
-                                Number::from_f64(rhs_val.as_f64().unwrap()).unwrap(),
-                            ));
-                        }
-
-                        match *operator {
-                            LogicOperator::Eq => *lhs_val == *rhs_val,
-                            LogicOperator::NotEq => *lhs_val != *rhs_val,
-                            _ => unreachable!(),
+                            match *operator {
+                                LogicOperator::Eq => *lhs_val == *rhs_val,
+                                LogicOperator::NotEq => *lhs_val != *rhs_val,
+                                _ => unreachable!(),
+                            }
                         }
                     }
                 }
@@ -944,7 +1004,7 @@ impl<'a> Processor<'a> {
                 to_value(
                     to_string_pretty(&self.call_stack.current_context_cloned().take()).unwrap(),
                 )
-                .unwrap(),
+                    .unwrap(),
             ));
         }
 
@@ -958,7 +1018,17 @@ impl<'a> Processor<'a> {
             // Comments are ignored when rendering
             Node::Comment(_, _) => (),
             Node::Text(ref s) | Node::Raw(_, ref s, _) => write!(write, "{}", s)?,
-            Node::VariableBlock(_, ref expr) => self.eval_expression(expr)?.render(write)?,
+            Node::VariableBlock(_, ref expr) => match self.eval_expression(expr) {
+                Ok(val) => val.render(write)?,
+                Err(e) => {
+                    if self.tera.loosely_render && matches!(e.kind, ErrorKind::VariableNotFound(_)) {
+                        let fallback = self.loose_fallback_value(&e);
+                        write!(write, "{}", fallback)?;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            },
             Node::Set(_, ref set) => self.eval_set(set)?,
             Node::FilterSection(_, FilterSection { ref filter, ref body }, _) => {
                 let body = render_to_string(

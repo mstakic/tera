@@ -76,6 +76,11 @@ pub struct Tera {
     pub autoescape_suffixes: Vec<&'static str>,
     #[doc(hidden)]
     escape_fn: EscapeFn,
+    // When true, missing variables do not abort rendering.
+    // The fallback value is read from the `undefined_var_fallback` 
+    // or rendered as `[ERROR: ...]`
+    #[doc(hidden)]
+    pub loosely_render: bool,
 }
 
 impl Tera {
@@ -95,6 +100,7 @@ impl Tera {
             testers: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
+            loosely_render: false,
         };
 
         tera.load_from_glob()?;
@@ -827,6 +833,11 @@ impl Tera {
         self.escape_fn = escape_html;
     }
 
+    /// Enable loose rendering mode
+    pub fn set_loosely_render(&mut self, enable: bool) {
+        self.loosely_render = enable;
+    }
+
     /// Re-parse all templates found in the glob given to Tera.
     ///
     /// Use this when you are watching a directory and want to reload everything,
@@ -899,6 +910,7 @@ impl Default for Tera {
             functions: HashMap::new(),
             autoescape_suffixes: vec![".html", ".htm", ".xml"],
             escape_fn: escape_html,
+            loosely_render: false,
         };
 
         tera.register_tera_filters();
@@ -955,7 +967,7 @@ mod tests {
             ("c", "{% extends \"d\" %}"),
             ("d", ""),
         ])
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             tera.get_template("a").unwrap().parents,
